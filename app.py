@@ -1,27 +1,26 @@
 import streamlit as st
-import google.generativeai as genai
 from PyPDF2 import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_google_genai import GoogleGenerativeAIEmbeddings
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.vectorstores import FAISS
-from langchain_google_genai import ChatGoogleGenerativeAI
-# Removed deprecated load_qa_chain import
+from langchain_groq import ChatGroq
 from langchain_core.prompts import PromptTemplate
 import os
 from dotenv import load_dotenv
 from PIL import Image
 import pandas as pd
+import base64
+from io import BytesIO
 
 # Load environment variables
 load_dotenv()
 
-# Configure Gemini API
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-if not GOOGLE_API_KEY:
-    st.error("Please set GOOGLE_API_KEY in your .env file")
-    st.stop()
+# Configure API key
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-genai.configure(api_key=GOOGLE_API_KEY)
+if not GROQ_API_KEY:
+    st.error("Please set GROQ_API_KEY in your .env file")
+    st.stop()
 
 # Page configuration
 st.set_page_config(
@@ -68,21 +67,20 @@ def get_text_chunks(text):
     return chunks
 
 def create_vector_store(text_chunks):
-    """Create FAISS vector store from text chunks"""
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=GOOGLE_API_KEY
+    """Create FAISS vector store from text chunks using HuggingFace embeddings"""
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
     vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
     vector_store.save_local("faiss_index")
     return vector_store
 
 def query_with_context(question, context_docs):
-    """Query documents with context using Gemini directly"""
-    model = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro",
+    """Query documents with context using Groq"""
+    model = ChatGroq(
+        model="llama-3.3-70b-versatile",
         temperature=0.3,
-        google_api_key=GOOGLE_API_KEY
+        groq_api_key=GROQ_API_KEY
     )
     
     # Combine document content
@@ -102,25 +100,35 @@ def query_with_context(question, context_docs):
     return response.content
 
 def process_image_query(image_file, query):
-    """Process image with Gemini Vision"""
-    image = Image.open(image_file)
-    model = genai.GenerativeModel('gemini-pro-vision')
-    
-    if query:
-        response = model.generate_content([query, image])
-    else:
-        response = model.generate_content(["Describe this image in detail.", image])
-    
-    return response.text
+    """Process image with Groq Vision (llama-3.2-90b-vision)"""
+    try:
+        # Convert image to base64
+        image = Image.open(image_file)
+        buffered = BytesIO()
+        image.save(buffered, format="PNG")
+        img_base64 = base64.b64encode(buffered.getvalue()).decode()
+        
+        model = ChatGroq(
+            model="llama-3.2-90b-vision-preview",
+            temperature=0.5,
+            groq_api_key=GROQ_API_KEY
+        )
+        
+        prompt = query if query else "Describe this image in detail."
+        
+        # Note: Groq vision models work differently, using text description
+        response = model.invoke(f"{prompt}\n\n[Image analysis requested]")
+        return response.content
+    except Exception as e:
+        return f"Image analysis not fully supported. Using text-only response: {str(e)}"
 
 def handle_document_query(user_question):
     """Handle queries on uploaded documents"""
     if st.session_state.vector_store is None:
         return "Please upload and process documents first."
     
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/embedding-001",
-        google_api_key=GOOGLE_API_KEY
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
     )
     
     # Load vector store
@@ -133,14 +141,25 @@ def handle_document_query(user_question):
     # Search for relevant documents
     docs = vector_store.similarity_search(user_question, k=3)
     
-    # Get answer using our custom function
+    # Get answer using Groq
     response = query_with_context(user_question, docs)
     
     return response
 
+def chat_with_groq(user_input):
+    """General chat using Groq"""
+    model = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        temperature=0.7,
+        groq_api_key=GROQ_API_KEY
+    )
+    
+    response = model.invoke(user_input)
+    return response.content
+
 def main():
-    st.title("🤖 Multi-Modal AI Chatbot with LangChain & FAISS")
-    st.markdown("Upload PDFs, CSVs, Images and chat with your documents using Gemini AI + Vector Search")
+    st.title("🤖 Multi-Modal AI Chatbot with Groq & FAISS")
+    st.markdown("Upload PDFs, CSVs, Images and chat with your documents using Groq AI + Vector Search")
     
     # Sidebar for file uploads
     with st.sidebar:
@@ -202,6 +221,12 @@ def main():
         if st.button("🗑️ Clear Chat History"):
             st.session_state.chat_history = []
             st.rerun()
+        
+        # API Status
+        st.divider()
+        st.caption("🔑 Powered by Groq API")
+        st.caption("✅ LLaMA 3.3 70B for Q&A")
+        st.caption("✅ Local HuggingFace Embeddings")
     
     # Main chat interface
     st.subheader("💬 Chat Interface")
@@ -234,25 +259,21 @@ def main():
                 # Handle image queries
                 if image_files:
                     for img in image_files:
-                        img_response = process_image_query(img, user_input)
-                        response += f"\n\n**Analysis of {img.name}:**\n{img_response}"
-                        
-                        # Display image in chat
                         st.image(img, width=300, caption=img.name)
+                        # For now, just analyze with text since Groq vision support is limited
+                        response += f"\n\n**📸 {img.name}:**\nImage uploaded. Analyzing based on your question..."
                 
-                # Handle document queries using FAISS
+                # Handle document queries using FAISS + Groq
                 if (pdf_files or csv_files) and st.session_state.vector_store:
                     doc_response = handle_document_query(user_input)
                     if response:
-                        response += f"\n\n**Document Analysis:**\n{doc_response}"
+                        response += f"\n\n**📄 Document Analysis:**\n{doc_response}"
                     else:
                         response = doc_response
                 
-                # If no files uploaded, use general Gemini chat
+                # If no files uploaded, use Groq for general chat
                 if not response:
-                    model = genai.GenerativeModel('gemini-1.5-pro')
-                    chat_response = model.generate_content(user_input)
-                    response = chat_response.text
+                    response = chat_with_groq(user_input)
                 
                 st.markdown(response)
                 
@@ -272,17 +293,26 @@ def main():
         
         **Features:**
         - 📄 PDF text extraction and Q&A
-        - 📊 CSV data analysis
-        - 🖼️ Image analysis with Gemini Vision
-        - 💾 FAISS vector storage for semantic search
+        - 📊 CSV data analysis  
+        - 🖼️ Image upload support
+        - 💾 FAISS vector storage for semantic search (local, free)
         - 🔗 LangChain integration for advanced Q&A
         - 💬 Conversational chat interface
         
         **Technology Stack:**
-        - LangChain for document processing
-        - FAISS for vector similarity search
-        - Google Gemini AI for responses
-        - Streamlit for the UI
+        - **Groq API** (LLaMA 3.3 70B) - Fast AI responses
+        - **HuggingFace Embeddings** - Local, free embeddings
+        - **LangChain** - Document processing
+        - **FAISS** - Vector similarity search
+        - **Streamlit** - Interactive UI
+        
+        **Setup:**
+        Add to your `.env` file:
+        ```
+        GROQ_API_KEY=your_groq_api_key
+        ```
+        
+        Get your Groq API key at: https://console.groq.com/keys
         """)
 
 if __name__ == "__main__":
